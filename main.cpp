@@ -58,6 +58,12 @@ public:
         return message.c_str();
     }
 };
+class InvalidDiodeException : public exception {
+public:
+    const char* what() const noexcept override {
+        return "Error: Diode model not found in library";
+    }
+};
 class NonExistentNodeInGNDException : public exception {
 public:
     const char* what() const noexcept override {
@@ -384,6 +390,89 @@ public:
     }
 };
 
+class Diode : public Component {
+private:
+    bool isOn = false;
+public:
+    Diode(string& name, const string& type, string& node1, string& node2, double value)
+            : Component(name, type, node1, node2, value) {}
+
+    static void addDiode(string& name, string& node1, string& node2) {
+        auto diode = findComponent(name);
+        if (diode)
+            throw DuplicateElementException("Diode", name);
+        components.push_back(make_shared<Diode>(name, "Diode", node1, node2, 0));
+    }
+
+    static void deleteDiode(const string& name) {
+        auto diode = findComponent(name);
+        if (!diode)
+            throw NonExistentElementException("diode");
+        components.erase(remove_if(components.begin(), components.end(),
+                                   [name](auto& comp) {
+                                       return comp->getName() == name;
+                                   }),
+                         components.end());
+    }
+
+    double getCurrent(double TStep) override {
+        double voltage = getVoltage(TStep);
+        isOn = (voltage > 0);
+
+        if (isOn) {
+            return 1e12 * voltage;
+        } else {
+            return 0;
+        }
+    }
+
+    double getConductance(double TStep) {
+        double voltage = getVoltage(TStep);
+        isOn = (voltage > 0);
+
+        if (isOn) {
+            return 1e12;
+        } else {
+            return 1e-12;
+        }
+    }
+};
+
+class Zener : public Component {
+public:
+    Zener(string& name, const string& type, string& node1, string& node2, double value)
+            : Component(name, type, node1, node2, value) {}
+
+    const double forwardDrop = 0.7;
+    bool isOn = false;
+    static void addZener(string& name, string& node1, string& node2, string& dType) {
+        auto zener = findComponent(name);
+        if (zener)
+            throw DuplicateElementException("Zener", name);
+        components.push_back(make_shared<Zener>(name, "Zener", node1, node2, 0));
+    }
+
+    double getCurrent(double TStep) override {
+        double voltage = getVoltage(TStep);
+        isOn = (voltage > forwardDrop);
+
+        if (isOn) {
+            return (voltage - forwardDrop) * 1e12;
+        }
+        return 0;
+    }
+
+    double getConductance(double TStep) {
+        double voltage = getVoltage(TStep);
+        isOn = (voltage > forwardDrop);
+
+        if (isOn) {
+            return 1e12;
+        }
+        return 1e-12;
+    }
+};
+
 
 class VoltageSource : public Component {
 private:
@@ -584,7 +673,7 @@ private:
         return false;
     }
 
-    static int findNodeIndex(shared_ptr<Node>& node) {
+    static int findNodeIndex(const shared_ptr<Node>& node) {
         auto it = find(Node::nodes.begin(), Node::nodes.end(), node);
         if (it != Node::nodes.end()) {
             return distance(Node::nodes.begin(), it);
@@ -675,6 +764,46 @@ private:
                 b[vSourceIndex] = vSin->getVoltage(currentTime);
                 vSourceIndex++;
             }
+            else if (comp->getType() == "Diode") {
+                auto diode = dynamic_pointer_cast<Diode>(comp);
+                double diodeConductance = diode->getConductance(TStep);
+                double diodeVoltage = diode->getVoltage(TStep);
+
+                int node1_index = findNodeIndex(comp->getNode1());
+                int node2_index = findNodeIndex(comp->getNode2());
+
+                A[node1_index][node1_index] += diodeConductance;
+                A[node2_index][node2_index] += diodeConductance;
+                A[node1_index][node2_index] -= diodeConductance;
+                A[node2_index][node1_index] -= diodeConductance;
+
+                if (diodeConductance > 1e6) {
+                    double largeG = 1e15;
+                    A[node1_index][node1_index] += largeG;
+                    A[node2_index][node2_index] += largeG;
+                    A[node1_index][node2_index] -= largeG;
+                    A[node2_index][node1_index] -= largeG;
+                }
+            }
+            else if (comp->getType() == "Zener") {
+                auto zener = dynamic_pointer_cast<Zener>(comp);
+                double zenerConductance = zener->getConductance(TStep);
+                double zenerVoltage = zener->getVoltage(TStep);
+
+                int node1_index = findNodeIndex(comp->getNode1());
+                int node2_index = findNodeIndex(comp->getNode2());
+
+                if (zener->isOn) {
+                    double G = zenerConductance;
+                    A[node1_index][node1_index] += G;
+                    A[node2_index][node2_index] += G;
+                    A[node1_index][node2_index] -= G;
+                    A[node2_index][node1_index] -= G;
+
+                    b[node1_index] += G * zener->forwardDrop;
+                    b[node2_index] -= G * zener->forwardDrop;
+                }
+            }
         }
 
         vector<double> solution = solveLinearSystem(A, b);
@@ -753,6 +882,15 @@ bool inputHandler(string& cmd) {
             string lStr = words[4];
             double L = stodValue(lStr, "Inductance", valueMode::positiveOnly);
             Inductor::addInductor(lName, node1, node2, L);
+        } else if (words[1].rfind('D', 0) == 0) {
+            string dName = words[1], node1 = words[2], node2 = words[3];
+            string dType = words[4];
+            if (dType == "D")
+                Diode::addDiode(dName, node1, node2);
+            else if (dType == "Z")
+                Zener::addZener(dName, node1, node2, dType);
+            else
+                throw InvalidDiodeException();
         } else
             throw InvalidElementException(words[1]);
     } else if (taskCheck(cmd, "delete") && n == 2) {
@@ -774,7 +912,11 @@ bool inputHandler(string& cmd) {
         } else if (words[1].rfind('L', 0) == 0) {
             string lName = words[1];
             Inductor::deleteInductor(lName);
-        }
+        } else if (words[1].rfind('D', 0) == 0) {
+            string dName = words[1];
+            Diode::deleteDiode(dName);
+        } else
+            throw InvalidElementException(words[1]);
     } else if (taskCheck(cmd, "add") && n == 3) {
         if (words[1] == "GND") {
             string nodeName = words[2];
@@ -1069,7 +1211,7 @@ void fileMenu() {
             showSchematicMenu();
         }
         else if(words[0]=="2" || words[0]=="NewFile") {
-            string filePath = input.substr(input.find(" ") + 1);
+            string filePath = input.substr(input.find(' ') + 1);
             newFileCommand(filePath);
         }
         else if(input == "3" || toLower(input) == "return") {
